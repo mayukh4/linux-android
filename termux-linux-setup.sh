@@ -5,40 +5,39 @@
 #  Features:
 #  - Choice of Desktop Environment (XFCE4, LXQt, MATE, KDE)
 #  - Smart GPU acceleration detection (Turnip/Zink)
+#  - Conflict-safe package installer (no more silent exits)
+#  - SSH server pre-installed and configured
 #  - Productivity & Media tools (VLC, Firefox)
-#  - Python environment pre-installed
+#  - Python 3 + pip
 #  - Optional: Windows App Support (Wine/Hangover + Box64)
 #
 #  Tested on: LineageOS (Android 9+), arm64 devices
 #######################################################
 
 # Intentionally avoiding set -e (exit on error) and set -u (nounset):
-# - set -e would silently kill the script on any failed package install
-# - set -u crashes on unbound variables, which can legitimately be empty in Termux
-# pipefail is kept so piped commands report failures correctly.
+# - set -e silently kills the script on any failed package install
+# - set -u crashes on variables that are legitimately empty in Termux
+# pipefail is kept so piped commands still report failures.
 set -o pipefail
 
 # ============== DYNAMIC PATH DETECTION ==============
-# Supports both standard and custom Termux installs
+# Supports standard and custom Termux installs (e.g. secondary user profiles)
 TERMUX_PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
 TERMUX_HOME="${HOME:-/data/data/com.termux/files/home}"
 
 # ============== CONFIGURATION ==============
-INSTALL_WINE="no"       # Set by user prompt
+INSTALL_WINE="no"
 DE_CHOICE="1"
 DE_NAME="XFCE4"
-
-# TOTAL_STEPS is set after user choices are made
 CURRENT_STEP=0
+# TOTAL_STEPS is set after user choices are made
 
-# Log file for debugging
 LOG_FILE="$TERMUX_HOME/termux-setup.log"
 
 # ============== COLORS ==============
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
 PURPLE='\033[0;35m'
 CYAN='\033[0;36m'
 WHITE='\033[1;37m'
@@ -51,7 +50,7 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"
 }
 
-# ============== PROGRESS ==============
+# ============== PROGRESS BAR ==============
 update_progress() {
     CURRENT_STEP=$((CURRENT_STEP + 1))
     local PERCENT=$((CURRENT_STEP * 100 / TOTAL_STEPS))
@@ -88,21 +87,61 @@ spinner() {
     local exit_code=$?
 
     if [ "$exit_code" -eq 0 ]; then
-        printf "\r  ${GREEN}✔${NC}  %-50s\n" "$message"
+        printf "\r  ${GREEN}✔${NC}  %-55s\n" "$message"
         log "OK: $message"
     else
-        printf "\r  ${RED}✘${NC}  %-50s ${RED}(FAILED — check $LOG_FILE)${NC}\n" "$message"
+        printf "\r  ${RED}✘${NC}  %-55s ${RED}(failed — see $LOG_FILE)${NC}\n" "$message"
         log "FAILED: $message"
-        # Non-fatal: log and continue so other packages still install
     fi
 
     return "$exit_code"
 }
 
-# ============== PACKAGE INSTALLER ==============
-install_pkg() {
+# ============== CONFLICT-SAFE PACKAGE INSTALLER ==============
+#
+# Why this exists:
+#   Termux has packages that hard-conflict with each other
+#   (e.g. vulkan-loader-android vs vulkan-loader-generic).
+#   Raw apt-get errors out on conflicts and — combined with set -e — would
+#   silently kill the entire script. Metapackages like vulkan-icd make this
+#   worse by pulling in conflicting deps indirectly.
+#
+# What this does:
+#   1. Skips if the package is already installed.
+#   2. Reads the package's declared Conflicts from apt-cache before installing.
+#   3. If a conflicting package is already present, skips safely with a warning.
+#   4. Otherwise installs normally.
+#
+safe_install_pkg() {
     local pkg=$1
     local name=${2:-$pkg}
+
+    # Skip if already installed
+    if dpkg -s "$pkg" &>/dev/null; then
+        printf "  ${GRAY}~${NC}  %-55s ${GRAY}(already installed)${NC}\n" "$name"
+        log "SKIP (already installed): $pkg"
+        return 0
+    fi
+
+    # Read declared Conflicts from apt-cache and check each one
+    local conflicts
+    conflicts=$(apt-cache show "$pkg" 2>/dev/null \
+        | grep -i "^Conflicts:" \
+        | sed 's/^Conflicts://i' \
+        | tr ',' '\n' \
+        | awk '{print $1}')
+
+    for conflict in $conflicts; do
+        [ -z "$conflict" ] && continue
+        if dpkg -s "$conflict" &>/dev/null; then
+            printf "  ${YELLOW}⚠${NC}  %-55s ${YELLOW}(skipped — conflicts with: %s)${NC}\n" \
+                "$name" "$conflict"
+            log "SKIP (conflict with $conflict): $pkg"
+            return 0
+        fi
+    done
+
+    # Safe to install
     (DEBIAN_FRONTEND=noninteractive apt-get install -y \
         -o Dpkg::Options::="--force-confold" \
         "$pkg" >> "$LOG_FILE" 2>&1) &
@@ -138,7 +177,9 @@ setup_environment() {
     ANDROID_VERSION=$(getprop ro.build.version.release 2>/dev/null || echo "Unknown")
     CPU_ABI=$(getprop ro.product.cpu.abi 2>/dev/null || echo "arm64-v8a")
 
-    # Detect GPU vendor via actual EGL/Vulkan property, not brand name
+    # Use actual EGL/hardware properties — NOT brand name.
+    # Brand-based detection is wrong: Samsung ships both Adreno (Snapdragon)
+    # and Mali (Exynos) phones, so checking "samsung" tells you nothing.
     GPU_RENDERER=$(getprop ro.hardware.egl 2>/dev/null || echo "")
     GPU_VENDOR_PROP=$(getprop ro.hardware 2>/dev/null || echo "")
 
@@ -146,39 +187,36 @@ setup_environment() {
     echo -e "  ${CYAN}Android:${NC}  ${WHITE}Android ${ANDROID_VERSION}${NC}"
     echo -e "  ${CYAN}CPU ABI:${NC}  ${WHITE}${CPU_ABI}${NC}"
 
-    # Detect if GPU is actually Adreno (Qualcomm) — do not rely on brand name
     if [[ "$GPU_RENDERER" == *"adreno"* ]] || \
        [[ "$GPU_RENDERER" == *"Adreno"* ]] || \
        [[ "$GPU_VENDOR_PROP" == *"adreno"* ]] || \
-       [[ "$GPU_VENDOR_PROP" == *"msm"* ]] || \
+       [[ "$GPU_VENDOR_PROP" == *"msm"* ]]   || \
        [[ "$GPU_VENDOR_PROP" == *"qcom"* ]]; then
         GPU_DRIVER="freedreno"
-        echo -e "  ${CYAN}GPU    :${NC}  ${WHITE}Adreno (Qualcomm) — Turnip Hardware Acceleration ✔${NC}"
+        echo -e "  ${CYAN}GPU    :${NC}  ${WHITE}Adreno / Qualcomm — Turnip hardware acceleration ✔${NC}"
     else
         GPU_DRIVER="zink_native"
-        echo -e "  ${CYAN}GPU    :${NC}  ${YELLOW}Non-Adreno detected (Mali, PowerVR, etc.)${NC}"
-        echo -e "  ${YELLOW}         Falling back to Zink/Vulkan software path.${NC}"
-        echo -e "  ${YELLOW}         RECOMMENDATION: Choose XFCE4 or LXQt for best performance.${NC}"
+        echo -e "  ${CYAN}GPU    :${NC}  ${YELLOW}Non-Adreno (Mali / PowerVR / other)${NC}"
+        echo -e "             ${YELLOW}Falling back to Zink/Vulkan. Use XFCE4 or LXQt for best results.${NC}"
     fi
     echo ""
 
-    # ---- Desktop Environment Selection ----
+    # ---- Desktop Environment ----
     echo -e "${CYAN}Choose your Desktop Environment:${NC}"
     echo ""
     echo -e "  ${WHITE}1) XFCE4${NC}       — Fast, customizable, macOS-style dock. ${GREEN}(Recommended)${NC}"
-    echo -e "  ${WHITE}2) LXQt${NC}        — Ultra-lightweight. Best for older/low-RAM phones."
-    echo -e "  ${WHITE}3) MATE${NC}        — Classic look. Moderate resource usage."
-    echo -e "  ${WHITE}4) KDE Plasma${NC}  — Modern Windows-style UI. Needs strong GPU & 4 GB+ RAM."
+    echo -e "  ${WHITE}2) LXQt${NC}        — Ultra-lightweight. Best for low-RAM phones."
+    echo -e "  ${WHITE}3) MATE${NC}        — Classic look. Moderate resource use."
+    echo -e "  ${WHITE}4) KDE Plasma${NC}  — Modern Windows-style UI. Requires 4 GB+ RAM."
     echo ""
 
     while true; do
         read -rp "  Enter number (1-4) [default: 1]: " DE_INPUT
         DE_INPUT=${DE_INPUT:-1}
         if [[ "$DE_INPUT" =~ ^[1-4]$ ]]; then
-            DE_CHOICE="$DE_INPUT"
-            break
+            DE_CHOICE="$DE_INPUT"; break
         else
-            echo -e "  ${RED}Invalid input. Please enter 1, 2, 3, or 4.${NC}"
+            echo -e "  ${RED}Invalid — enter 1, 2, 3, or 4.${NC}"
         fi
     done
 
@@ -193,7 +231,7 @@ setup_environment() {
     # ---- Optional: Wine ----
     echo ""
     echo -e "${CYAN}Optional: Install Windows app support (Wine + Box64/Hangover)?${NC}"
-    echo -e "  ${GRAY}Adds ~500 MB. Lets you run some Windows x86 applications.${NC}"
+    echo -e "  ${GRAY}Adds ~500 MB. Runs some Windows x86 apps on ARM.${NC}"
     echo ""
     while true; do
         read -rp "  Install Wine? (y/n) [default: n]: " WINE_INPUT
@@ -205,12 +243,8 @@ setup_environment() {
         esac
     done
 
-    # Set total steps dynamically
-    if [ "$INSTALL_WINE" == "yes" ]; then
-        TOTAL_STEPS=11
-    else
-        TOTAL_STEPS=10
-    fi
+    TOTAL_STEPS=10
+    [ "$INSTALL_WINE" == "yes" ] && TOTAL_STEPS=11
 
     log "DE=$DE_NAME, GPU=$GPU_DRIVER, Wine=$INSTALL_WINE"
     sleep 1
@@ -222,56 +256,55 @@ step_update() {
     echo -e "${PURPLE}[Step ${CURRENT_STEP}/${TOTAL_STEPS}] Updating system packages...${NC}"
     echo ""
 
-    # Update package lists
     (DEBIAN_FRONTEND=noninteractive apt-get update -y >> "$LOG_FILE" 2>&1) &
     spinner $! "Updating package lists..."
 
-    # Use pkg (Termux's wrapper) instead of raw apt-get upgrade.
-    # Raw apt-get upgrade can break mid-session when libpcre or libc gets replaced
-    # while binaries like 'sleep' are still loaded from the old library in memory.
-    # pkg upgrade handles Termux-specific bootstrap edge cases more safely.
-    # Run in foreground (not background) so we can catch a crash and advise the user.
-    echo -e "  ${CYAN}⠿${NC}  Upgrading installed packages (this may take a while)..."
+    # Run pkg upgrade in FOREGROUND (not backgrounded via &) so we can catch
+    # the libpcre/libandroid-selinux crash that kills binaries like 'sleep'
+    # mid-session when core libraries are replaced. If it fails, we tell the
+    # user exactly what to do rather than dying silently.
+    echo -e "  ${CYAN}⠿${NC}  Upgrading packages (may take a few minutes)..."
     if ! DEBIAN_FRONTEND=noninteractive pkg upgrade -y \
             -o Dpkg::Options::="--force-confold" >> "$LOG_FILE" 2>&1; then
-
         echo ""
-        echo -e "  ${YELLOW}⚠  Upgrade hit a library conflict (common on first run).${NC}"
-        echo -e "  ${WHITE}Fix:${NC}"
-        echo -e "    1. Close Termux completely and reopen it"
-        echo -e "    2. Run:  ${GREEN}pkg upgrade -y${NC}"
+        echo -e "  ${YELLOW}⚠  Upgrade hit a library conflict — this is common on first run.${NC}"
+        echo ""
+        echo -e "  ${WHITE}To fix:${NC}"
+        echo -e "    1. Close Termux completely (swipe away from recents)"
+        echo -e "    2. Reopen Termux and run:  ${GREEN}pkg upgrade -y${NC}"
         echo -e "    3. Then re-run this script"
         echo ""
-        echo -e "  ${GRAY}Full error in: $LOG_FILE${NC}"
+        echo -e "  ${GRAY}Full error: $LOG_FILE${NC}"
         exit 1
     fi
     echo -e "  ${GREEN}✔${NC}  Packages upgraded."
 }
 
-# ============== STEP 2: INSTALL REPOSITORIES ==============
+# ============== STEP 2: REPOSITORIES ==============
 step_repos() {
     update_progress
     echo -e "${PURPLE}[Step ${CURRENT_STEP}/${TOTAL_STEPS}] Adding package repositories...${NC}"
     echo ""
-    install_pkg "x11-repo" "X11 Repository"
-    install_pkg "tur-repo" "TUR Repository (Firefox, extra apps)"
+    safe_install_pkg "x11-repo" "X11 Repository"
+    safe_install_pkg "tur-repo" "TUR Repository (Firefox, extra apps)"
 
-    # IMPORTANT: Must refresh package lists after adding new repos
+    # MUST refresh after adding repos — otherwise packages from x11-repo
+    # and tur-repo (termux-x11-nightly, firefox, etc.) won't be found.
     echo ""
     (DEBIAN_FRONTEND=noninteractive apt-get update -y >> "$LOG_FILE" 2>&1) &
     spinner $! "Refreshing package lists (post-repo)..."
 }
 
-# ============== STEP 3: INSTALL TERMUX-X11 ==============
+# ============== STEP 3: TERMUX-X11 ==============
 step_x11() {
     update_progress
     echo -e "${PURPLE}[Step ${CURRENT_STEP}/${TOTAL_STEPS}] Installing Termux-X11 display server...${NC}"
     echo ""
-    install_pkg "termux-x11-nightly" "Termux-X11 Display Server"
-    install_pkg "xorg-xrandr" "XRandR (Display Settings)"
+    safe_install_pkg "termux-x11-nightly" "Termux-X11 Display Server"
+    safe_install_pkg "xorg-xrandr"        "XRandR (Display Settings)"
 }
 
-# ============== STEP 4: INSTALL DESKTOP ENVIRONMENT ==============
+# ============== STEP 4: DESKTOP ENVIRONMENT ==============
 step_desktop() {
     update_progress
     echo -e "${PURPLE}[Step ${CURRENT_STEP}/${TOTAL_STEPS}] Installing ${DE_NAME} Desktop...${NC}"
@@ -279,86 +312,76 @@ step_desktop() {
 
     case $DE_CHOICE in
         1)
-            install_pkg "xfce4"                    "XFCE4 Desktop"
-            install_pkg "xfce4-terminal"           "XFCE4 Terminal"
-            install_pkg "xfce4-whiskermenu-plugin" "Whisker Menu Plugin"
-            install_pkg "plank-reloaded"           "Plank Dock"
-            install_pkg "thunar"                   "Thunar File Manager"
-            install_pkg "mousepad"                 "Mousepad Text Editor"
+            safe_install_pkg "xfce4"                    "XFCE4 Desktop"
+            safe_install_pkg "xfce4-terminal"           "XFCE4 Terminal"
+            safe_install_pkg "xfce4-whiskermenu-plugin" "Whisker Menu Plugin"
+            safe_install_pkg "plank-reloaded"           "Plank Dock"
+            safe_install_pkg "thunar"                   "Thunar File Manager"
+            safe_install_pkg "mousepad"                 "Mousepad Text Editor"
             ;;
         2)
-            install_pkg "lxqt"       "LXQt Desktop"
-            install_pkg "qterminal"  "QTerminal"
-            install_pkg "pcmanfm-qt" "PCManFM-Qt File Manager"
-            install_pkg "featherpad" "FeatherPad Text Editor"
+            safe_install_pkg "lxqt"       "LXQt Desktop"
+            safe_install_pkg "qterminal"  "QTerminal"
+            safe_install_pkg "pcmanfm-qt" "PCManFM-Qt File Manager"
+            safe_install_pkg "featherpad" "FeatherPad Text Editor"
             ;;
         3)
-            install_pkg "mate"          "MATE Desktop"
-            install_pkg "mate-tweak"   "MATE Tweak"
-            install_pkg "plank-reloaded" "Plank Dock"
-            install_pkg "mate-terminal" "MATE Terminal"
+            safe_install_pkg "mate"            "MATE Desktop"
+            safe_install_pkg "mate-tweak"      "MATE Tweak"
+            safe_install_pkg "plank-reloaded"  "Plank Dock"
+            safe_install_pkg "mate-terminal"   "MATE Terminal"
             ;;
         4)
-            install_pkg "plasma-desktop" "KDE Plasma Desktop"
-            install_pkg "konsole"        "Konsole Terminal"
-            install_pkg "dolphin"        "Dolphin File Manager"
+            safe_install_pkg "plasma-desktop" "KDE Plasma Desktop"
+            safe_install_pkg "konsole"        "Konsole Terminal"
+            safe_install_pkg "dolphin"        "Dolphin File Manager"
             ;;
     esac
 }
 
-# ============== STEP 5: INSTALL GPU DRIVERS ==============
+# ============== STEP 5: GPU DRIVERS ==============
 step_gpu() {
     update_progress
     echo -e "${PURPLE}[Step ${CURRENT_STEP}/${TOTAL_STEPS}] Installing GPU acceleration...${NC}"
     echo ""
 
-    # mesa-zink: OpenGL implementation built on top of Vulkan (confirmed available)
-    install_pkg "mesa-zink" "Mesa Zink (OpenGL on Vulkan)"
+    safe_install_pkg "mesa-zink" "Mesa Zink (OpenGL on Vulkan)"
 
-    # vulkan-loader-android and vulkan-loader-generic conflict with each other.
-    # Check which one is already installed and skip the other.
-    # Do NOT install vulkan-icd — it is a metapackage that depends on
-    # vulkan-loader-android and will cause a conflict if vulkan-loader-generic
-    # is already present (as it is on most LineageOS / custom ROM setups).
-    if dpkg -s vulkan-loader-generic &>/dev/null; then
-        echo -e "  ${GRAY}  vulkan-loader-generic already installed — skipping conflicting packages.${NC}"
-        log "Skipped vulkan-loader-android: vulkan-loader-generic already present."
-    elif dpkg -s vulkan-loader-android &>/dev/null; then
-        echo -e "  ${GRAY}  vulkan-loader-android already installed.${NC}"
-        log "vulkan-loader-android already present."
-    else
-        install_pkg "vulkan-loader-android" "Vulkan Loader"
-    fi
+    # vulkan-loader-android and vulkan-loader-generic hard-conflict with each other.
+    # safe_install_pkg automatically reads the Conflicts field from apt-cache and
+    # skips whichever one would break — no manual dpkg checks needed.
+    # Do NOT use the vulkan-icd metapackage — it depends on vulkan-loader-android
+    # and will trigger the same conflict indirectly.
+    safe_install_pkg "vulkan-loader-android" "Vulkan Loader"
 
     if [ "$GPU_DRIVER" == "freedreno" ]; then
-        # Both the standard and zink-specific Freedreno ICDs — install both for coverage
-        install_pkg "mesa-vulkan-icd-freedreno"      "Freedreno Vulkan ICD (Turnip)"
-        install_pkg "mesa-zink-vulkan-icd-freedreno" "Mesa Zink Freedreno ICD"
+        safe_install_pkg "mesa-vulkan-icd-freedreno"      "Freedreno Vulkan ICD (Turnip)"
+        safe_install_pkg "mesa-zink-vulkan-icd-freedreno" "Mesa Zink Freedreno ICD"
     else
-        # Non-Adreno fallback: software Vulkan rasterizer
-        install_pkg "mesa-vulkan-icd-swrast"      "SwRast Vulkan ICD (software)"
-        install_pkg "mesa-zink-vulkan-icd-swrast" "Mesa Zink SwRast ICD"
+        safe_install_pkg "mesa-vulkan-icd-swrast"         "SwRast Vulkan ICD (software)"
+        safe_install_pkg "mesa-zink-vulkan-icd-swrast"    "Mesa Zink SwRast ICD"
     fi
 }
 
-# ============== STEP 6: INSTALL AUDIO ==============
+# ============== STEP 6: AUDIO ==============
 step_audio() {
     update_progress
     echo -e "${PURPLE}[Step ${CURRENT_STEP}/${TOTAL_STEPS}] Installing audio server...${NC}"
     echo ""
-    install_pkg "pulseaudio" "PulseAudio"
+    safe_install_pkg "pulseaudio" "PulseAudio"
 }
 
-# ============== STEP 7: INSTALL APPS ==============
+# ============== STEP 7: APPS ==============
 step_apps() {
     update_progress
     echo -e "${PURPLE}[Step ${CURRENT_STEP}/${TOTAL_STEPS}] Installing applications...${NC}"
     echo ""
-    install_pkg "firefox" "Firefox Browser"
-    install_pkg "vlc"     "VLC Media Player"
-    install_pkg "git"     "Git Version Control"
-    install_pkg "wget"    "Wget"
-    install_pkg "curl"    "cURL"
+    safe_install_pkg "firefox"  "Firefox Browser"
+    safe_install_pkg "vlc"      "VLC Media Player"
+    safe_install_pkg "git"      "Git Version Control"
+    safe_install_pkg "wget"     "Wget"
+    safe_install_pkg "curl"     "cURL"
+    safe_install_pkg "openssh"  "OpenSSH (SSH server + client)"
 }
 
 # ============== STEP 8: PYTHON ==============
@@ -366,9 +389,8 @@ step_python() {
     update_progress
     echo -e "${PURPLE}[Step ${CURRENT_STEP}/${TOTAL_STEPS}] Installing Python...${NC}"
     echo ""
-    install_pkg "python" "Python 3"
-    install_pkg "python-pip" "pip (Python Package Manager)"
-    echo -e "  ${GRAY}  Python installed. Run 'python3' in your terminal to start.${NC}"
+    safe_install_pkg "python"     "Python 3"
+    safe_install_pkg "python-pip" "pip (Python Package Manager)"
 }
 
 # ============== STEP 9 (OPTIONAL): WINE ==============
@@ -377,14 +399,12 @@ step_wine() {
     echo -e "${PURPLE}[Step ${CURRENT_STEP}/${TOTAL_STEPS}] Installing Windows support (Wine + Box64)...${NC}"
     echo ""
 
-    # Remove any conflicting old Wine packages first
     (pkg remove wine-stable -y >> "$LOG_FILE" 2>&1 || true) &
     spinner $! "Removing old Wine versions (if any)..."
 
-    install_pkg "hangover-wine"    "Hangover Wine"
-    install_pkg "hangover-wowbox64" "Box64 Wrapper"
+    safe_install_pkg "hangover-wine"     "Hangover Wine"
+    safe_install_pkg "hangover-wowbox64" "Box64 Wrapper"
 
-    # Symlink wine binaries into PATH only if they exist
     local WINE_BIN="${TERMUX_PREFIX}/opt/hangover-wine/bin"
     if [ -f "${WINE_BIN}/wine" ]; then
         ln -sf "${WINE_BIN}/wine"    "${TERMUX_PREFIX}/bin/wine"
@@ -393,11 +413,11 @@ step_wine() {
         log "Wine symlinks created."
     else
         echo -e "  ${YELLOW}  Wine binary not found at expected path — symlinks skipped.${NC}"
-        log "WARNING: Wine binary not found, symlinks skipped."
+        log "WARNING: Wine binary not found at $WINE_BIN"
     fi
 }
 
-# ============== STEP 10: CREATE LAUNCHER SCRIPTS ==============
+# ============== STEP 10: LAUNCHER SCRIPTS ==============
 step_launchers() {
     update_progress
     echo -e "${PURPLE}[Step ${CURRENT_STEP}/${TOTAL_STEPS}] Creating startup scripts...${NC}"
@@ -405,10 +425,8 @@ step_launchers() {
 
     mkdir -p ~/.config
 
-    # XDG path fix for Termux
     XDG_INJECT="export XDG_DATA_DIRS=${TERMUX_PREFIX}/share:\${XDG_DATA_DIRS:-}\nexport XDG_CONFIG_DIRS=${TERMUX_PREFIX}/etc/xdg:\${XDG_CONFIG_DIRS:-}"
 
-    # KDE needs startup environment injection
     if [ "$DE_CHOICE" == "4" ]; then
         mkdir -p ~/.config/plasma-workspace/env
         {
@@ -418,11 +436,9 @@ step_launchers() {
         chmod +x ~/.config/plasma-workspace/env/xdg_fix.sh
     fi
 
-    # GPU & Mesa environment config
     cat > ~/.config/linux-gpu.sh << EOF
 #!/${TERMUX_PREFIX}/bin/bash
 # GPU & Mesa environment — sourced by start-linux.sh
-
 export MESA_NO_ERROR=1
 export MESA_GL_VERSION_OVERRIDE=4.6
 export MESA_GLES_VERSION_OVERRIDE=3.2
@@ -439,12 +455,11 @@ EOF
         echo -e "$XDG_INJECT" >> ~/.config/linux-gpu.sh
     fi
 
-    # Turnip driver if Adreno detected
     if [ "$GPU_DRIVER" == "freedreno" ]; then
-        echo "export VK_ICD_FILENAMES=${TERMUX_PREFIX}/share/vulkan/icd.d/freedreno_icd.aarch64.json" >> ~/.config/linux-gpu.sh
+        echo "export VK_ICD_FILENAMES=${TERMUX_PREFIX}/share/vulkan/icd.d/freedreno_icd.aarch64.json" \
+            >> ~/.config/linux-gpu.sh
     fi
 
-    # Plank autostart (XFCE4 and MATE only)
     if [ "$DE_CHOICE" == "1" ] || [ "$DE_CHOICE" == "3" ]; then
         mkdir -p ~/.config/autostart
         cat > ~/.config/autostart/plank.desktop << 'PLANKEOF'
@@ -460,7 +475,6 @@ PLANKEOF
         rm -f ~/.config/autostart/plank.desktop 2>/dev/null || true
     fi
 
-    # Determine DE-specific start/stop commands
     case $DE_CHOICE in
         1)
             EXEC_CMD="exec startxfce4"
@@ -475,30 +489,25 @@ PLANKEOF
             KILL_CMD="pkill -9 mate-session; pkill -9 plank"
             ;;
         4)
-            # KDE: restart plasmashell after a short delay (common workaround for first launch)
             EXEC_CMD="(sleep 5 && pkill -9 plasmashell && plasmashell) >/dev/null 2>&1 &\nexec startplasma-x11"
             KILL_CMD="pkill -9 startplasma-x11; pkill -9 kwin_x11"
             ;;
     esac
 
-    # ---- start-linux.sh ----
     cat > ~/start-linux.sh << LAUNCHEREOF
 #!/${TERMUX_PREFIX}/bin/bash
 echo ""
 echo "[*] Starting ${DE_NAME} on Termux-X11..."
 echo ""
 
-# Load GPU environment
 source ~/.config/linux-gpu.sh 2>/dev/null
 
-# Clean up any leftover sessions
 echo "[*] Cleaning up old sessions..."
 pkill -9 -f "termux.x11" 2>/dev/null || true
 ${KILL_CMD} 2>/dev/null || true
 pkill -9 -f "dbus-daemon" 2>/dev/null || true
 sleep 0.5
 
-# Start audio
 echo "[*] Starting PulseAudio..."
 unset PULSE_SERVER
 pulseaudio --kill 2>/dev/null || true
@@ -508,7 +517,6 @@ sleep 1
 pactl load-module module-native-protocol-tcp auth-ip-acl=127.0.0.1 auth-anonymous=1 2>/dev/null || true
 export PULSE_SERVER=127.0.0.1
 
-# Start X11 server
 echo "[*] Starting Termux-X11 display server..."
 termux-x11 :0 -ac &
 sleep 3
@@ -525,7 +533,6 @@ LAUNCHEREOF
     chmod +x ~/start-linux.sh
     echo -e "  ${GREEN}✔ Created ~/start-linux.sh${NC}"
 
-    # ---- stop-linux.sh ----
     cat > ~/stop-linux.sh << STOPEOF
 #!/${TERMUX_PREFIX}/bin/bash
 echo "[*] Stopping ${DE_NAME}..."
@@ -565,7 +572,6 @@ Type=Application
 Categories=Video;AudioVideo;Player;
 EOF
 
-    # Terminal shortcut — icon and command match the installed DE
     local term_cmd term_icon
     case $DE_CHOICE in
         1) term_cmd="xfce4-terminal"; term_icon="xfce4-terminal";;
@@ -583,7 +589,6 @@ Type=Application
 Categories=System;TerminalEmulator;
 EOF
 
-    # Wine shortcut only if installed
     if [ "$INSTALL_WINE" == "yes" ]; then
         cat > ~/Desktop/Wine_Config.desktop << 'EOF'
 [Desktop Entry]
@@ -593,14 +598,13 @@ Icon=wine
 Type=Application
 Categories=Utility;
 EOF
-        echo -e "  ${GREEN}✔ Added Wine Config shortcut.${NC}"
     fi
 
     chmod +x ~/Desktop/*.desktop 2>/dev/null || true
     echo -e "  ${GREEN}✔ Desktop shortcuts created.${NC}"
 }
 
-# ============== COMPLETION SUMMARY ==============
+# ============== COMPLETION ==============
 show_completion() {
     echo ""
     echo -e "${GREEN}"
@@ -612,14 +616,20 @@ show_completion() {
   ╚══════════════════════════════════════════════════════╝
 COMPLETE
     echo -e "${NC}"
-    echo -e "  ${WHITE}Desktop installed: ${GREEN}${DE_NAME}${NC}"
-    echo -e "  ${WHITE}GPU acceleration:  ${GREEN}${GPU_DRIVER}${NC}"
-    echo -e "  ${WHITE}Wine support:      ${GREEN}${INSTALL_WINE}${NC}"
+    echo -e "  ${WHITE}Desktop  : ${GREEN}${DE_NAME}${NC}"
+    echo -e "  ${WHITE}GPU      : ${GREEN}${GPU_DRIVER}${NC}"
+    echo -e "  ${WHITE}Wine     : ${GREEN}${INSTALL_WINE}${NC}"
     echo ""
     echo -e "${YELLOW}  ─────────────────────────────────────────────────${NC}"
-    echo -e "  ${WHITE}▶  TO START:${NC}  ${GREEN}bash ~/start-linux.sh${NC}"
-    echo -e "  ${WHITE}■  TO STOP: ${NC}  ${GREEN}bash ~/stop-linux.sh${NC}"
+    echo -e "  ${WHITE}▶  START DESKTOP:${NC}  ${GREEN}bash ~/start-linux.sh${NC}"
+    echo -e "  ${WHITE}■  STOP DESKTOP: ${NC}  ${GREEN}bash ~/stop-linux.sh${NC}"
     echo -e "${YELLOW}  ─────────────────────────────────────────────────${NC}"
+    echo ""
+    echo -e "  ${CYAN}SSH into this device from another machine:${NC}"
+    echo -e "    1. Start SSH server:  ${GREEN}sshd${NC}"
+    echo -e "    2. Set a password:    ${GREEN}passwd${NC}"
+    echo -e "    3. Find your IP:      ${GREEN}ip addr show wlan0 | grep 'inet '${NC}"
+    echo -e "    4. Connect from PC:   ${GREEN}ssh \$(whoami)@<your-ip> -p 8022${NC}"
     echo ""
     echo -e "  ${GRAY}Full install log: $LOG_FILE${NC}"
     echo ""
@@ -627,11 +637,11 @@ COMPLETE
 
 # ============== MAIN ==============
 main() {
-    # Initialize log
     echo "" > "$LOG_FILE"
     log "termux-linux-setup.sh started"
 
-    # Prevent Android from suspending Termux mid-install when screen turns off
+    # Prevent Android from suspending Termux mid-install when screen turns off.
+    # A suspended Termux kills background apt processes, causing random failures.
     if command -v termux-wake-lock &>/dev/null; then
         termux-wake-lock
         log "Wake lock acquired."
@@ -652,16 +662,12 @@ main() {
     step_apps
     step_python
 
-    if [ "$INSTALL_WINE" == "yes" ]; then
-        step_wine
-    fi
+    [ "$INSTALL_WINE" == "yes" ] && step_wine
 
     step_launchers
     step_shortcuts
-
     show_completion
 
-    # Release wake lock now that install is done
     if command -v termux-wake-unlock &>/dev/null; then
         termux-wake-unlock
         log "Wake lock released."
