@@ -217,11 +217,31 @@ step_update() {
     update_progress
     echo -e "${PURPLE}[Step ${CURRENT_STEP}/${TOTAL_STEPS}] Updating system packages...${NC}"
     echo ""
+
+    # Update package lists
     (DEBIAN_FRONTEND=noninteractive apt-get update -y >> "$LOG_FILE" 2>&1) &
     spinner $! "Updating package lists..."
-    (DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -q \
-        -o Dpkg::Options::="--force-confold" >> "$LOG_FILE" 2>&1) &
-    spinner $! "Upgrading installed packages..."
+
+    # Use pkg (Termux's wrapper) instead of raw apt-get upgrade.
+    # Raw apt-get upgrade can break mid-session when libpcre or libc gets replaced
+    # while binaries like 'sleep' are still loaded from the old library in memory.
+    # pkg upgrade handles Termux-specific bootstrap edge cases more safely.
+    # Run in foreground (not background) so we can catch a crash and advise the user.
+    echo -e "  ${CYAN}⠿${NC}  Upgrading installed packages (this may take a while)..."
+    if ! DEBIAN_FRONTEND=noninteractive pkg upgrade -y \
+            -o Dpkg::Options::="--force-confold" >> "$LOG_FILE" 2>&1; then
+
+        echo ""
+        echo -e "  ${YELLOW}⚠  Upgrade hit a library conflict (common on first run).${NC}"
+        echo -e "  ${WHITE}Fix:${NC}"
+        echo -e "    1. Close Termux completely and reopen it"
+        echo -e "    2. Run:  ${GREEN}pkg upgrade -y${NC}"
+        echo -e "    3. Then re-run this script"
+        echo ""
+        echo -e "  ${GRAY}Full error in: $LOG_FILE${NC}"
+        exit 1
+    fi
+    echo -e "  ${GREEN}✔${NC}  Packages upgraded."
 }
 
 # ============== STEP 2: INSTALL REPOSITORIES ==============
