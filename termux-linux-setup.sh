@@ -311,10 +311,20 @@ setup_environment() {
     echo -e "${PURPLE}[*] Detecting your device...${NC}"
     echo ""
 
-    DEVICE_MODEL=$(getprop ro.product.model 2>/dev/null || echo "Unknown")
-    DEVICE_BRAND=$(getprop ro.product.brand 2>/dev/null || echo "Unknown")
-    ANDROID_VERSION=$(getprop ro.build.version.release 2>/dev/null || echo "Unknown")
-    CPU_ABI=$(getprop ro.product.cpu.abi 2>/dev/null || echo "arm64-v8a")
+    # `getprop X || echo default` does not do what it looks like: `||` only runs
+    # when the command *fails* (non-zero exit), but a getprop that succeeds and
+    # prints nothing still yields an empty string. The defaults were therefore
+    # never applied when the property was empty, and the banner printed
+    # `Device :`, `Android: Android` and `CPU ABI:` with blank values.
+    # Apply the default to the captured value instead.
+    DEVICE_MODEL=$(getprop ro.product.model 2>/dev/null)
+    DEVICE_MODEL=${DEVICE_MODEL:-Unknown}
+    DEVICE_BRAND=$(getprop ro.product.brand 2>/dev/null)
+    DEVICE_BRAND=${DEVICE_BRAND:-Unknown}
+    ANDROID_VERSION=$(getprop ro.build.version.release 2>/dev/null)
+    ANDROID_VERSION=${ANDROID_VERSION:-Unknown}
+    CPU_ABI=$(getprop ro.product.cpu.abi 2>/dev/null)
+    CPU_ABI=${CPU_ABI:-arm64-v8a}
 
     # Use actual EGL/hardware properties — NOT brand name.
     # Brand-based detection is wrong: Samsung ships both Adreno (Snapdragon)
@@ -714,7 +724,7 @@ chmod 700 "\$XDG_RUNTIME_DIR" 2>/dev/null || true
 
 DBUS_DIR="${TERMUX_PREFIX}/var/run/dbus"
 rm -rf "\$HOME/.dbus" 2>/dev/null || true
-rm -f "${TERMUX_PREFIX}/tmp/dbus-"* 2>/dev/null || true
+rm -f "\${XDG_RUNTIME_DIR}/dbus-"* 2>/dev/null || true
 mkdir -p "\$DBUS_DIR" "${TERMUX_PREFIX}/var/lib/dbus"
 rm -f "\$DBUS_DIR/session_bus_socket"
 dbus-uuidgen --ensure >/dev/null 2>&1 || true
@@ -731,9 +741,22 @@ echo "[*] Starting PulseAudio..."
 unset PULSE_SERVER
 pulseaudio --kill 2>/dev/null || true
 sleep 0.3
-pulseaudio --start --exit-idle-time=-1
-sleep 1
-pactl load-module module-native-protocol-tcp auth-ip-acl=127.0.0.1 auth-anonymous=1 2>/dev/null || true
+# Both calls are time-bounded on purpose. `pulseaudio --start` and `pactl` can
+# block indefinitely when the audio HAL is wedged, and the "|| true" below only
+# rescues a command that *fails* -- not one that never returns. Unbounded, a
+# stuck PulseAudio stalls the launcher here and `termux-x11` is never started,
+# so the desktop silently never appears (Termux-X11 just says "Not connected")
+# with no error to act on. Audio is optional; it must never hold up the display.
+if command -v timeout >/dev/null 2>&1; then
+    timeout 10 pulseaudio --start --exit-idle-time=-1 \
+        || echo "[!] PulseAudio did not start - continuing without audio."
+    sleep 1
+    timeout 5 pactl load-module module-native-protocol-tcp auth-ip-acl=127.0.0.1 auth-anonymous=1 2>/dev/null || true
+else
+    pulseaudio --start --exit-idle-time=-1 || true
+    sleep 1
+    pactl load-module module-native-protocol-tcp auth-ip-acl=127.0.0.1 auth-anonymous=1 2>/dev/null || true
+fi
 export PULSE_SERVER=127.0.0.1
 
 echo "[*] Starting Termux-X11 display server..."
