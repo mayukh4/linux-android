@@ -24,8 +24,23 @@ jobs:
             bash -n "$f"
           done
 
-      # shellcheck runs at error severity only. These scripts intentionally
+      # shellcheck runs at warning severity. These scripts intentionally
       # avoid `set -e`/`set -u` (see the header comment in termux-linux-setup.sh),
       # which trips a lot of shellcheck's style and info-level advice.
       - name: shellcheck
-        run: shellcheck --severity=error --shell=bash *.sh
+        run: shellcheck --severity=warning --shell=bash *.sh
+
+      # The flag parser runs before anything Termux-specific, so it can be
+      # exercised on a normal runner. Also checks the scripts refuse to run
+      # outside Termux instead of half-installing.
+      - name: CLI smoke test
+        run: |
+          bash termux-linux-setup.sh --help | grep -q -- "--de"
+          bash setup-homeassistant.sh --help | grep -q -- "--no-hacs"
+          ! bash termux-linux-setup.sh --de nope 2>/dev/null
+          ! bash termux-linux-setup.sh --bogus 2>/dev/null
+          ! bash setup-homeassistant.sh --bogus 2>/dev/null
+          out=$(HOME=$(mktemp -d) PREFIX=/nonexistent bash termux-linux-setup.sh -y 2>&1 < /dev/null || true)
+          echo "$out" | grep -q "must be run inside Termux"
+          out=$(HOME=$(mktemp -d) PREFIX=/nonexistent bash setup-homeassistant.sh -y 2>&1 < /dev/null || true)
+          echo "$out" | grep -q "must be run inside Termux"

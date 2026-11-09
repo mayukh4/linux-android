@@ -19,7 +19,9 @@ There is no build system and no test suite. Before opening a PR:
 
 1. `bash -n termux-linux-setup.sh && bash -n setup-homeassistant.sh` — a syntax
    error here strands someone half-way through a 30-minute install.
-2. `shellcheck --severity=error --shell=bash *.sh` — same check CI runs.
+2. `shellcheck --severity=warning --shell=bash *.sh` — same check CI runs.
+   CI also runs `--help` and a few bad flags through both scripts, so keep
+   `parse_args` free of anything Termux-specific.
 3. Run the changed script end to end on a real device, and say which device and
    Android version you tested on in the PR description.
 
@@ -38,6 +40,11 @@ There is no build system and no test suite. Before opening a PR:
 - **Desktop-specific logic branches on `$DE_CHOICE`** (1=XFCE4, 2=LXQt, 3=MATE,
   4=KDE). If you add a desktop, update every `case` that switches on it —
   packages, kill command, start command, terminal shortcut.
+- **Never `read` from stdin directly.** Use the `ask` helper. With
+  `curl ... | bash` stdin *is* the script, so a bare `read` eats the rest of it.
+  Every new choice also needs a flag, so `-y` installs stay fully unattended.
+- **Redirect `< /dev/null` on anything that might prompt** (apt, pkg) for the
+  same reason.
 - **Colors:** GREEN success, RED error, YELLOW warning, CYAN info, GRAY skipped.
 
 ## Adding or changing a package

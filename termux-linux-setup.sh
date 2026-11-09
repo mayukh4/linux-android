@@ -10,6 +10,7 @@
 #  - Productivity & Media tools (VLC, Firefox)
 #  - Python 3 + pip
 #  - Optional: Windows App Support (Wine/Hangover + Box64)
+#  - One-line install (curl | bash) and unattended flags: see --help
 #
 #  Tested on: LineageOS (Android 9+), arm64 devices
 #######################################################
@@ -33,7 +34,119 @@ DE_NAME="XFCE4"
 CURRENT_STEP=0
 # TOTAL_STEPS is set after user choices are made
 
+# Set from command-line flags (see usage below).
+DE_FROM_FLAG=""
+WINE_FROM_FLAG=""
+ASSUME_YES="no"
+
 LOG_FILE="$TERMUX_HOME/termux-setup.log"
+
+# Options for every apt call.
+# - confold/confdef: never stop to ask about a changed config file.
+# - Retries/Timeout: a stalled mirror fails and retries instead of hanging the
+#   install forever with the spinner still going (issue #7).
+# - Lock::Timeout: wait for another apt/dpkg (e.g. a second Termux session)
+#   instead of failing at once.
+APT_OPTS=(
+    -o Dpkg::Options::=--force-confdef
+    -o Dpkg::Options::=--force-confold
+    -o Acquire::Retries=3
+    -o Acquire::http::Timeout=30
+    -o Acquire::https::Timeout=30
+    -o DPkg::Lock::Timeout=300
+)
+
+# ============== COMMAND-LINE FLAGS ==============
+usage() {
+    cat << 'USAGE'
+Usage: bash termux-linux-setup.sh [options]
+
+Turn an Android phone into a Linux desktop with Termux + Termux-X11.
+Run with no options for the interactive installer.
+
+Options:
+  --de <name>   Desktop to install: xfce (default), lxqt, mate, kde
+  --wine        Also install Windows app support (Hangover Wine + Box64)
+  --no-wine     Skip Wine (default)
+  -y, --yes     Don't ask anything; use the flags above or the defaults
+  -h, --help    Show this help
+
+One-line install:
+  curl -fsSL https://raw.githubusercontent.com/mayukh4/linux-android/main/termux-linux-setup.sh | bash
+
+One-line, unattended, KDE without Wine:
+  curl -fsSL https://raw.githubusercontent.com/mayukh4/linux-android/main/termux-linux-setup.sh | bash -s -- --de kde --no-wine -y
+
+Re-running is safe: installed packages are skipped and the launchers are
+regenerated. Install log: ~/termux-setup.log
+USAGE
+}
+
+# Map a desktop name or number to DE_CHOICE.
+de_from_name() {
+    case "$(echo "$1" | tr '[:upper:]' '[:lower:]')" in
+        1|xfce|xfce4)        echo 1 ;;
+        2|lxqt)              echo 2 ;;
+        3|mate)              echo 3 ;;
+        4|kde|plasma|kde-plasma) echo 4 ;;
+        *) return 1 ;;
+    esac
+}
+
+parse_args() {
+    local arg val
+    while [ $# -gt 0 ]; do
+        arg=$1
+        case "$arg" in
+            --de|--desktop)
+                val=${2:-}
+                [ $# -ge 2 ] && shift
+                ;;
+            --de=*|--desktop=*)
+                val=${arg#*=}
+                arg=--de
+                ;;
+        esac
+        case "$arg" in
+            --de|--desktop)
+                if ! DE_FROM_FLAG=$(de_from_name "$val"); then
+                    echo "Unknown desktop: '${val}'. Use xfce, lxqt, mate or kde." >&2
+                    exit 2
+                fi
+                ;;
+            --wine)    WINE_FROM_FLAG="yes" ;;
+            --no-wine) WINE_FROM_FLAG="no" ;;
+            -y|--yes)  ASSUME_YES="yes" ;;
+            -h|--help) usage; exit 0 ;;
+            *)
+                echo "Unknown option: $arg" >&2
+                usage >&2
+                exit 2
+                ;;
+        esac
+        shift
+    done
+}
+
+# Where to read answers from. With `curl ... | bash` stdin is the script
+# itself, so a plain `read` would swallow the rest of it; read from the
+# terminal instead. No terminal at all (CI, nohup) means use the defaults.
+TTY_IN=""
+if [ -t 0 ]; then
+    TTY_IN=/dev/stdin
+elif { : < /dev/tty; } 2>/dev/null; then
+    TTY_IN=/dev/tty
+fi
+
+# ask <var> <prompt> — read one answer, or leave it empty (= default) when
+# running unattended.
+ask() {
+    local __reply=""
+    if [ "$ASSUME_YES" != "yes" ] && [ -n "$TTY_IN" ]; then
+        read -rp "$2" __reply < "$TTY_IN" || __reply=""
+    fi
+    printf -v "$1" '%s' "$__reply"
+}
 
 # ============== COLORS ==============
 RED='\033[0;31m'
@@ -72,59 +185,96 @@ update_progress() {
 }
 
 # ============== SPINNER ==============
-spinner() {
+#
+# Big packages (KDE, Firefox, Wine) can take many minutes on a slow phone or
+# connection, and a bare spinner looks exactly like a hang (issue #7). So the
+# spinner shows the elapsed time and, after a few seconds, the latest line apt
+# wrote to the log ("Get:12 ... firefox [74.1 MB]", "Unpacking ...").
+# If the log stops moving for several minutes it says so, once.
+
+# Latest non-empty log line, stripped of control characters.
+last_log_line() {
+    tail -n 3 "$LOG_FILE" 2>/dev/null \
+        | tr -d '\r' \
+        | sed 's/\x1b\[[0-9;]*[A-Za-z]//g' \
+        | grep -v '^[[:space:]]*$' \
+        | tail -n 1
+}
+
+_spin() {
     local pid=$1
     local message=$2
+    local optional=$3
     local spin=('⠋' '⠙' '⠸' '⠴' '⠦' '⠇')
-    local i=0
+    local i=0 tick=0
+    local start=$SECONDS elapsed
+    local cols detail="" line
+    local size last_size=-1 last_change=$SECONDS warned=0
+
+    cols=$(tput cols 2>/dev/null || echo 80)
+    [ "$cols" -gt 20 ] 2>/dev/null || cols=80
 
     while kill -0 "$pid" 2>/dev/null; do
-        printf "\r  ${CYAN}${spin[$i]}${NC}  %s  " "$message"
+        elapsed=$((SECONDS - start))
+
+        # Once a second: refresh the detail line and check for a stall.
+        if [ $((tick % 10)) -eq 0 ]; then
+            size=$(wc -c < "$LOG_FILE" 2>/dev/null || echo 0)
+            if [ "$size" != "$last_size" ]; then
+                last_size=$size
+                last_change=$SECONDS
+            fi
+            if [ "$elapsed" -ge 4 ]; then
+                detail=$(last_log_line)
+            fi
+            if [ "$warned" -eq 0 ] && [ $((SECONDS - last_change)) -ge 300 ]; then
+                warned=1
+                printf "\r\033[K  ${YELLOW}⚠${NC}  No progress for 5 minutes. Check your connection and keep\n"
+                printf "     Termux in the foreground. If it never moves, press Ctrl+C and\n"
+                printf "     re-run the script — installed packages are skipped.\n"
+                log "STALL: no log output for 300s during: $message"
+            fi
+        fi
+
+        line=$(printf "%s [%d:%02d]" "$message" $((elapsed / 60)) $((elapsed % 60)))
+        if [ -n "$detail" ]; then
+            line="$line · $detail"
+        fi
+        # Keep it on one line so \r can redraw it.
+        line=${line:0:$((cols - 6))}
+        printf "\r\033[K  ${CYAN}%s${NC}  %s" "${spin[$i]}" "$line"
+
         i=$(( (i + 1) % 6 ))
+        tick=$((tick + 1))
         sleep 0.1
     done
 
     wait "$pid"
     local exit_code=$?
+    elapsed=$((SECONDS - start))
+    local took=""
+    [ "$elapsed" -ge 10 ] && took=$(printf " (%d:%02d)" $((elapsed / 60)) $((elapsed % 60)))
 
     if [ "$exit_code" -eq 0 ]; then
-        printf "\r  ${GREEN}✔${NC}  %-55s\n" "$message"
+        printf "\r\033[K  ${GREEN}✔${NC}  %-55s${GRAY}%s${NC}\n" "$message" "$took"
         log "OK: $message"
+    elif [ "$optional" = "optional" ]; then
+        printf "\r\033[K  ${YELLOW}⚠${NC}  %-55s ${YELLOW}(optional — skipped)${NC}\n" "$message"
+        log "OPTIONAL FAILED: $message"
+        return 0
     else
-        printf "\r  ${RED}✘${NC}  %-55s ${RED}(failed — see $LOG_FILE)${NC}\n" "$message"
+        printf "\r\033[K  ${RED}✘${NC}  %-55s ${RED}(failed — see $LOG_FILE)${NC}\n" "$message"
         log "FAILED: $message"
     fi
 
     return "$exit_code"
 }
 
+spinner() { _spin "$1" "$2" ""; }
+
 # Same as spinner, but a failure is reported as a warning rather than an error.
 # For packages the desktop still works without.
-spinner_optional() {
-    local pid=$1
-    local message=$2
-    local spin=('⠋' '⠙' '⠸' '⠴' '⠦' '⠇')
-    local i=0
-
-    while kill -0 "$pid" 2>/dev/null; do
-        printf "\r  ${CYAN}${spin[$i]}${NC}  %s  " "$message"
-        i=$(( (i + 1) % 6 ))
-        sleep 0.1
-    done
-
-    wait "$pid"
-    local exit_code=$?
-
-    if [ "$exit_code" -eq 0 ]; then
-        printf "\r  ${GREEN}✔${NC}  %-55s\n" "$message"
-        log "OK: $message"
-    else
-        printf "\r  ${YELLOW}⚠${NC}  %-55s ${YELLOW}(optional — skipped)${NC}\n" "$message"
-        log "OPTIONAL FAILED: $message"
-    fi
-
-    return 0
-}
+spinner_optional() { _spin "$1" "$2" "optional"; }
 
 # ============== DPKG / APT HELPERS ==============
 
@@ -276,9 +426,9 @@ $(apt_field "$pkg" Provides)")
         fi
     done <<< "$(apt_field "$pkg" Conflicts | tr ',' '\n')"
 
-    (DEBIAN_FRONTEND=noninteractive apt-get install -y \
-        -o Dpkg::Options::="--force-confold" \
-        "$pkg" >> "$LOG_FILE" 2>&1) &
+    log "INSTALL: $pkg"
+    (DEBIAN_FRONTEND=noninteractive apt-get install -y "${APT_OPTS[@]}" \
+        "$pkg" < /dev/null >> "$LOG_FILE" 2>&1) &
 
     if [ "$optional" = "optional" ]; then
         spinner_optional $! "Installing ${name}..."
@@ -336,6 +486,24 @@ setup_environment() {
     echo -e "  ${CYAN}Android:${NC}  ${WHITE}Android ${ANDROID_VERSION}${NC}"
     echo -e "  ${CYAN}CPU ABI:${NC}  ${WHITE}${CPU_ABI}${NC}"
 
+    # Termux-X11, Turnip and Hangover are only built for 64-bit ARM. Warn
+    # rather than abort: some 32-bit userlands on 64-bit chips still get far.
+    case "$(uname -m)" in
+        aarch64|arm64) ;;
+        *)
+            echo -e "  ${YELLOW}⚠  $(uname -m) detected. This script targets arm64 (aarch64);${NC}"
+            echo -e "  ${YELLOW}   GPU acceleration and Wine will likely be unavailable.${NC}"
+            log "WARNING: non-arm64 arch $(uname -m)"
+            ;;
+    esac
+
+    local free_mb
+    free_mb=$(df -m "$TERMUX_HOME" 2>/dev/null | awk 'NR==2 {print $4}')
+    if [ -n "$free_mb" ] && [ "$free_mb" -lt 4000 ] 2>/dev/null; then
+        echo -e "  ${YELLOW}⚠  Only ${free_mb} MB free. A desktop needs 4–6 GB (more with Wine/KDE).${NC}"
+        log "WARNING: low storage ${free_mb}MB"
+    fi
+
     if [[ "$GPU_RENDERER" == *"adreno"* ]] || \
        [[ "$GPU_RENDERER" == *"Adreno"* ]] || \
        [[ "$GPU_VENDOR_PROP" == *"adreno"* ]] || \
@@ -359,15 +527,19 @@ setup_environment() {
     echo -e "  ${WHITE}4) KDE Plasma${NC}  — Modern Windows-style UI. Requires 4 GB+ RAM."
     echo ""
 
-    while true; do
-        read -rp "  Enter number (1-4) [default: 1]: " DE_INPUT
-        DE_INPUT=${DE_INPUT:-1}
-        if [[ "$DE_INPUT" =~ ^[1-4]$ ]]; then
-            DE_CHOICE="$DE_INPUT"; break
-        else
-            echo -e "  ${RED}Invalid — enter 1, 2, 3, or 4.${NC}"
-        fi
-    done
+    if [ -n "$DE_FROM_FLAG" ]; then
+        DE_CHOICE="$DE_FROM_FLAG"
+    else
+        while true; do
+            ask DE_INPUT "  Enter number (1-4) [default: 1]: "
+            DE_INPUT=${DE_INPUT:-1}
+            if [[ "$DE_INPUT" =~ ^[1-4]$ ]]; then
+                DE_CHOICE="$DE_INPUT"; break
+            else
+                echo -e "  ${RED}Invalid — enter 1, 2, 3, or 4.${NC}"
+            fi
+        done
+    fi
 
     case $DE_CHOICE in
         1) DE_NAME="XFCE4";;
@@ -382,15 +554,24 @@ setup_environment() {
     echo -e "${CYAN}Optional: Install Windows app support (Wine + Box64/Hangover)?${NC}"
     echo -e "  ${GRAY}Adds ~500 MB. Runs some Windows x86 apps on ARM.${NC}"
     echo ""
-    while true; do
-        read -rp "  Install Wine? (y/n) [default: n]: " WINE_INPUT
-        WINE_INPUT=${WINE_INPUT:-n}
-        case "$WINE_INPUT" in
-            [Yy]*) INSTALL_WINE="yes"; echo -e "  ${GREEN}✔ Wine will be installed.${NC}"; break;;
-            [Nn]*) INSTALL_WINE="no";  echo -e "  ${GRAY}  Wine skipped.${NC}"; break;;
-            *) echo -e "  ${RED}Please enter y or n.${NC}";;
-        esac
-    done
+    if [ -n "$WINE_FROM_FLAG" ]; then
+        INSTALL_WINE="$WINE_FROM_FLAG"
+    else
+        while true; do
+            ask WINE_INPUT "  Install Wine? (y/n) [default: n]: "
+            WINE_INPUT=${WINE_INPUT:-n}
+            case "$WINE_INPUT" in
+                [Yy]*) INSTALL_WINE="yes"; break;;
+                [Nn]*) INSTALL_WINE="no";  break;;
+                *) echo -e "  ${RED}Please enter y or n.${NC}";;
+            esac
+        done
+    fi
+    if [ "$INSTALL_WINE" == "yes" ]; then
+        echo -e "  ${GREEN}✔ Wine will be installed.${NC}"
+    else
+        echo -e "  ${GRAY}  Wine skipped.${NC}"
+    fi
 
     TOTAL_STEPS=10
     [ "$INSTALL_WINE" == "yes" ] && TOTAL_STEPS=11
@@ -405,7 +586,8 @@ step_update() {
     echo -e "${PURPLE}[Step ${CURRENT_STEP}/${TOTAL_STEPS}] Updating system packages...${NC}"
     echo ""
 
-    (DEBIAN_FRONTEND=noninteractive apt-get update -y >> "$LOG_FILE" 2>&1) &
+    (DEBIAN_FRONTEND=noninteractive apt-get update -y "${APT_OPTS[@]}" \
+        < /dev/null >> "$LOG_FILE" 2>&1) &
     spinner $! "Updating package lists..."
 
     # Run pkg upgrade in FOREGROUND (not backgrounded via &) so we can catch
@@ -413,8 +595,8 @@ step_update() {
     # mid-session when core libraries are replaced. If it fails, we tell the
     # user exactly what to do rather than dying silently.
     echo -e "  ${CYAN}⠿${NC}  Upgrading packages (may take a few minutes)..."
-    if ! DEBIAN_FRONTEND=noninteractive pkg upgrade -y \
-            -o Dpkg::Options::="--force-confold" >> "$LOG_FILE" 2>&1; then
+    if ! DEBIAN_FRONTEND=noninteractive pkg upgrade -y "${APT_OPTS[@]}" \
+            < /dev/null >> "$LOG_FILE" 2>&1; then
         echo ""
         echo -e "  ${YELLOW}⚠  Upgrade hit a library conflict — this is common on first run.${NC}"
         echo ""
@@ -440,7 +622,8 @@ step_repos() {
     # MUST refresh after adding repos — otherwise packages from x11-repo
     # and tur-repo (termux-x11-nightly, firefox, etc.) won't be found.
     echo ""
-    (DEBIAN_FRONTEND=noninteractive apt-get update -y >> "$LOG_FILE" 2>&1) &
+    (DEBIAN_FRONTEND=noninteractive apt-get update -y "${APT_OPTS[@]}" \
+        < /dev/null >> "$LOG_FILE" 2>&1) &
     spinner $! "Refreshing package lists (post-repo)..."
 }
 
@@ -600,8 +783,16 @@ step_wine() {
     echo -e "${PURPLE}[Step ${CURRENT_STEP}/${TOTAL_STEPS}] Installing Windows support (Wine + Box64)...${NC}"
     echo ""
 
-    (pkg remove wine-stable -y >> "$LOG_FILE" 2>&1 || true) &
-    spinner $! "Removing old Wine versions (if any)..."
+    # Only touch apt when there is actually something to remove. The old
+    # unconditional `pkg remove` went through the pkg wrapper (mirror checks,
+    # possible prompts) for nothing on almost every install.
+    if pkg_installed "wine-stable"; then
+        (DEBIAN_FRONTEND=noninteractive apt-get remove -y "${APT_OPTS[@]}" \
+            wine-stable < /dev/null >> "$LOG_FILE" 2>&1) &
+        spinner_optional $! "Removing old wine-stable..."
+    fi
+
+    echo -e "  ${GRAY}Wine is a large download (~500 MB) — this step can take a while.${NC}"
 
     safe_install_pkg "hangover-wine"     "Hangover Wine"
     safe_install_pkg "hangover-wowbox64" "Box64 Wrapper"
@@ -886,20 +1077,35 @@ COMPLETE
 
 # ============== MAIN ==============
 main() {
-    echo "" > "$LOG_FILE"
-    log "termux-linux-setup.sh started"
+    : > "$LOG_FILE"
+    log "termux-linux-setup.sh started (args: $*)"
+
+    # This script is for Termux. Bail out early and clearly anywhere else,
+    # instead of failing ten steps in.
+    if [ ! -d "$TERMUX_PREFIX" ] || ! command -v pkg >/dev/null 2>&1; then
+        echo -e "${RED}This script must be run inside Termux on Android.${NC}"
+        echo -e "Get Termux from F-Droid: https://f-droid.org/en/packages/com.termux/"
+        exit 1
+    fi
 
     # Prevent Android from suspending Termux mid-install when screen turns off.
     # A suspended Termux kills background apt processes, causing random failures.
     if command -v termux-wake-lock &>/dev/null; then
         termux-wake-lock
         log "Wake lock acquired."
+        # Release it however we exit: success, an early `exit 1`, or Ctrl+C.
+        trap 'termux-wake-unlock 2>/dev/null' EXIT
+        trap 'echo; echo "Interrupted. Re-run the script to continue — finished steps are skipped."; exit 130' INT TERM
     else
         echo -e "${YELLOW}  [!] termux-wake-lock unavailable — keep your screen on during install.${NC}"
         echo ""
     fi
 
     show_banner
+    if [ "$ASSUME_YES" == "yes" ] || [ -z "$TTY_IN" ]; then
+        echo -e "${GRAY}  Running unattended — using flags/defaults for every choice.${NC}"
+        echo ""
+    fi
     setup_environment
 
     step_update
@@ -923,4 +1129,5 @@ main() {
     fi
 }
 
-main
+parse_args "$@"
+main "$@"

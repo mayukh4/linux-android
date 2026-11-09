@@ -2,6 +2,8 @@
 
 **[English](README.md)**
 
+[![listed on unshittify.dev](https://unshittify.dev/badge.svg)](https://unshittify.dev/p/linux-android/)
+
 > 本翻译可能落后于英文 README。以 [README.md](README.md) 为准。
 
 将任意旧安卓手机变成 **Linux 桌面**或**智能家居服务器** — 无需电脑、无需 Root、无需云服务，只需 [Termux](https://termux.dev)。
@@ -84,17 +86,23 @@ pkg upgrade -y
 
 `termux-wake-lock` 命令可保持 Termux 在屏幕关闭时继续运行 — 没有它，安卓可能会在安装过程中杀死进程。`pkg upgrade` 会在脚本运行前更新基础系统，避免 `libpcre` 和 `libandroid-selinux` 相关的已知崩溃问题。
 
-### 步骤 3 — 下载并运行脚本
+### 步骤 3 — 运行脚本
 
 ```bash
-curl -O https://raw.githubusercontent.com/mayukh4/linux-android/main/termux-linux-setup.sh
-chmod +x termux-linux-setup.sh
-bash termux-linux-setup.sh
+curl -fsSL https://raw.githubusercontent.com/mayukh4/linux-android/main/termux-linux-setup.sh | bash
 ```
 
-脚本会询问你选择哪个桌面环境以及是否安装 Wine，其余全部自动完成。
+脚本会询问你选择哪个桌面环境以及是否安装 Wine，其余全部自动完成。想先阅读脚本再运行，可以用 `curl -O` 下载后执行 `bash termux-linux-setup.sh`。
 
-安装耗时 **10–30 分钟**，取决于网络速度。完整的日志保存在 `~/termux-setup.log` 中，方便排查问题。
+安装耗时 **10–30 分钟**，取决于网络速度。每个软件包都会显示计时和 apt 的最新输出行，方便区分"大文件下载中"和"真的卡住"。完整的日志保存在 `~/termux-setup.log` 中。重复运行脚本是安全的 — 已安装的包会被跳过。
+
+**无人值守安装**（不提问）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mayukh4/linux-android/main/termux-linux-setup.sh | bash -s -- --de kde --no-wine -y
+```
+
+`--de` 可选 `xfce`（默认）、`lxqt`、`mate`、`kde`；`--wine` / `--no-wine`；`-y` 表示全部使用默认值；`--help` 查看全部选项。
 
 ### 步骤 4 — 启动桌面
 
@@ -255,9 +263,10 @@ Home Assistant Core 运行在手机上的轻量级 Ubuntu 容器中（通过 pro
 ### 安装
 
 ```bash
-curl -O https://raw.githubusercontent.com/mayukh4/linux-android/main/setup-homeassistant.sh
-bash setup-homeassistant.sh
+curl -fsSL https://raw.githubusercontent.com/mayukh4/linux-android/main/setup-homeassistant.sh | bash
 ```
+
+无人值守：`... | bash -s -- --hacs -y`。运行 `bash setup-homeassistant.sh --help` 查看全部选项。
 
 安装耗时 **15–45 分钟**，取决于手机性能。最耗时的步骤是在 Ubuntu 容器中编译 Home Assistant 的 Python 依赖（numpy、cryptography 等）。
 
@@ -378,6 +387,16 @@ echo 'termux-wake-lock && nohup bash ~/start-homeassistant.sh > ~/hass.log 2>&1 
 ---
 
 ## 故障排除
+
+**安装似乎卡在某一步**
+KDE Plasma、Firefox、Wine 等大包有几百 MB，网络或手机较慢时可能需要 10 分钟以上。只要计时后面的 apt 输出行还在变化，就说明仍在进行。如果 5 分钟没有任何进展，脚本会打印警告。此时：保持 Termux 在前台并亮屏；在第二个 Termux 会话中运行 `tail -f ~/termux-setup.log` 查看日志；或按 `Ctrl+C` 后重新运行脚本（已安装的包会被跳过）；镜像太慢可用 `termux-change-repo` 切换镜像。
+
+**Termux 退出并显示 "[Process completed (signal 9)]"（Android 12+）**
+这是 Android 12 引入的"幻影进程终止"机制。**Android 14+**：开启 *开发者选项 → 停用子进程限制*。Android 12–13：在电脑上通过 ADB 执行一次：
+
+```bash
+adb shell "/system/bin/device_config set_sync_disabled_for_tests persistent; /system/bin/device_config put activity_manager max_phantom_processes 2147483647"
+```
 
 **脚本安装中途退出且无明确错误**
 查看 `~/termux-setup.log`。脚本会记录每个包的安装结果，最后一行会告诉你具体是哪个包导致了失败。

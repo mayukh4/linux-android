@@ -30,6 +30,13 @@ body:
     validations:
       required: true
 
+  - type: input
+    id: step
+    attributes:
+      label: Where did it stop?
+      description: The step number and the exact line on screen, e.g. "Step 9/11 — Installing Hangover Wine... [12:40]". Did you choose Wine?
+      placeholder: "Step 9/11 — Installing Hangover Wine... (Wine: yes)"
+
   - type: textarea
     id: device
     attributes:

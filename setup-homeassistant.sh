@@ -25,7 +25,82 @@ CURRENT_STEP=0
 TOTAL_STEPS=7
 INSTALL_HACS="no"
 
+HACS_FROM_FLAG=""
+ASSUME_YES="no"
+
 LOG_FILE="$TERMUX_HOME/termux-setup.log"
+
+# Same apt options as termux-linux-setup.sh: never prompt about config files,
+# retry/time out on a stalled mirror instead of hanging, wait for the dpkg lock.
+APT_OPTS=(
+    -o Dpkg::Options::=--force-confdef
+    -o Dpkg::Options::=--force-confold
+    -o Acquire::Retries=3
+    -o Acquire::http::Timeout=30
+    -o Acquire::https::Timeout=30
+    -o DPkg::Lock::Timeout=300
+)
+# The same, as a string for apt inside the Ubuntu container.
+APT_OPTS_STR="${APT_OPTS[*]}"
+
+# ============== COMMAND-LINE FLAGS ==============
+usage() {
+    cat << 'USAGE'
+Usage: bash setup-homeassistant.sh [options]
+
+Install Home Assistant Core on Android (Termux + proot-distro Ubuntu).
+Run with no options for the interactive installer.
+
+Options:
+  --hacs        Also install HACS, the community store (default)
+  --no-hacs     Skip HACS
+  -y, --yes     Don't ask anything; use the flags above or the defaults
+  -h, --help    Show this help
+
+One-line install:
+  curl -fsSL https://raw.githubusercontent.com/mayukh4/linux-android/main/setup-homeassistant.sh | bash
+
+Re-running is safe: finished steps are skipped. Install log: ~/termux-setup.log
+USAGE
+}
+
+parse_args() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --hacs)    HACS_FROM_FLAG="yes" ;;
+            --no-hacs) HACS_FROM_FLAG="no" ;;
+            -y|--yes)  ASSUME_YES="yes" ;;
+            -h|--help) usage; exit 0 ;;
+            *)
+                echo "Unknown option: $1" >&2
+                usage >&2
+                exit 2
+                ;;
+        esac
+        shift
+    done
+}
+
+# Where to read answers from. With `curl ... | bash` stdin is the script
+# itself, so a plain `read` would swallow the rest of it; read from the
+# terminal instead. No terminal at all (CI, nohup) means use the defaults.
+TTY_IN=""
+if [ -t 0 ]; then
+    TTY_IN=/dev/stdin
+elif { : < /dev/tty; } 2>/dev/null; then
+    TTY_IN=/dev/tty
+fi
+
+# ask <var> <prompt> — read one answer, or leave it empty (= default) when
+# running unattended.
+ask() {
+    local __reply=""
+    if [ "$ASSUME_YES" != "yes" ] && [ -n "$TTY_IN" ]; then
+        read -rp "$2" __reply < "$TTY_IN" || __reply=""
+    fi
+    printf -v "$1" '%s' "$__reply"
+}
+
 
 # ============== COLORS ==============
 RED='\033[0;31m'
@@ -36,7 +111,6 @@ CYAN='\033[0;36m'
 WHITE='\033[1;37m'
 GRAY='\033[0;90m'
 NC='\033[0m'
-BOLD='\033[1m'
 
 # ============== LOGGING ==============
 log() {
@@ -64,38 +138,104 @@ update_progress() {
 }
 
 # ============== SPINNER ==============
-spinner() {
+#
+# Big packages (KDE, Firefox, Wine) can take many minutes on a slow phone or
+# connection, and a bare spinner looks exactly like a hang (issue #7). So the
+# spinner shows the elapsed time and, after a few seconds, the latest line apt
+# wrote to the log ("Get:12 ... firefox [74.1 MB]", "Unpacking ...").
+# If the log stops moving for several minutes it says so, once.
+
+# Latest non-empty log line, stripped of control characters.
+last_log_line() {
+    tail -n 3 "$LOG_FILE" 2>/dev/null \
+        | tr -d '\r' \
+        | sed 's/\x1b\[[0-9;]*[A-Za-z]//g' \
+        | grep -v '^[[:space:]]*$' \
+        | tail -n 1
+}
+
+_spin() {
     local pid=$1
     local message=$2
+    local optional=$3
     local spin=('⠋' '⠙' '⠸' '⠴' '⠦' '⠇')
-    local i=0
+    local i=0 tick=0
+    local start=$SECONDS elapsed
+    local cols detail="" line
+    local size last_size=-1 last_change=$SECONDS warned=0
+
+    cols=$(tput cols 2>/dev/null || echo 80)
+    [ "$cols" -gt 20 ] 2>/dev/null || cols=80
 
     while kill -0 "$pid" 2>/dev/null; do
-        printf "\r  ${CYAN}${spin[$i]}${NC}  %s  " "$message"
+        elapsed=$((SECONDS - start))
+
+        # Once a second: refresh the detail line and check for a stall.
+        if [ $((tick % 10)) -eq 0 ]; then
+            size=$(wc -c < "$LOG_FILE" 2>/dev/null || echo 0)
+            if [ "$size" != "$last_size" ]; then
+                last_size=$size
+                last_change=$SECONDS
+            fi
+            if [ "$elapsed" -ge 4 ]; then
+                detail=$(last_log_line)
+            fi
+            if [ "$warned" -eq 0 ] && [ $((SECONDS - last_change)) -ge 300 ]; then
+                warned=1
+                printf "\r\033[K  ${YELLOW}⚠${NC}  No progress for 5 minutes. Check your connection and keep\n"
+                printf "     Termux in the foreground. If it never moves, press Ctrl+C and\n"
+                printf "     re-run the script — installed packages are skipped.\n"
+                log "STALL: no log output for 300s during: $message"
+            fi
+        fi
+
+        line=$(printf "%s [%d:%02d]" "$message" $((elapsed / 60)) $((elapsed % 60)))
+        if [ -n "$detail" ]; then
+            line="$line · $detail"
+        fi
+        # Keep it on one line so \r can redraw it.
+        line=${line:0:$((cols - 6))}
+        printf "\r\033[K  ${CYAN}%s${NC}  %s" "${spin[$i]}" "$line"
+
         i=$(( (i + 1) % 6 ))
+        tick=$((tick + 1))
         sleep 0.1
     done
 
     wait "$pid"
     local exit_code=$?
+    elapsed=$((SECONDS - start))
+    local took=""
+    [ "$elapsed" -ge 10 ] && took=$(printf " (%d:%02d)" $((elapsed / 60)) $((elapsed % 60)))
 
     if [ "$exit_code" -eq 0 ]; then
-        printf "\r  ${GREEN}✔${NC}  %-55s\n" "$message"
+        printf "\r\033[K  ${GREEN}✔${NC}  %-55s${GRAY}%s${NC}\n" "$message" "$took"
         log "OK: $message"
+    elif [ "$optional" = "optional" ]; then
+        printf "\r\033[K  ${YELLOW}⚠${NC}  %-55s ${YELLOW}(optional — skipped)${NC}\n" "$message"
+        log "OPTIONAL FAILED: $message"
+        return 0
     else
-        printf "\r  ${RED}✘${NC}  %-55s ${RED}(failed — see $LOG_FILE)${NC}\n" "$message"
+        printf "\r\033[K  ${RED}✘${NC}  %-55s ${RED}(failed — see $LOG_FILE)${NC}\n" "$message"
         log "FAILED: $message"
     fi
 
     return "$exit_code"
 }
 
+spinner() { _spin "$1" "$2" ""; }
+
+# Same as spinner, but a failure is reported as a warning rather than an error.
+# For packages the desktop still works without.
+spinner_optional() { _spin "$1" "$2" "optional"; }
+
 # ============== TERMUX PACKAGE INSTALLER ==============
 safe_install_pkg() {
     local pkg=$1
     local name=${2:-$pkg}
 
-    if dpkg -s "$pkg" &>/dev/null; then
+    # dpkg -s also succeeds for removed-but-not-purged packages.
+    if [ "$(dpkg-query -W -f='${db:Status-Status}' "$pkg" 2>/dev/null)" = "installed" ]; then
         printf "  ${GRAY}~${NC}  %-55s ${GRAY}(already installed)${NC}\n" "$name"
         log "SKIP (already installed): $pkg"
         return 0
@@ -110,7 +250,7 @@ safe_install_pkg() {
 
     for conflict in $conflicts; do
         [ -z "$conflict" ] && continue
-        if dpkg -s "$conflict" &>/dev/null; then
+        if [ "$(dpkg-query -W -f='${db:Status-Status}' "$conflict" 2>/dev/null)" = "installed" ]; then
             printf "  ${YELLOW}⚠${NC}  %-55s ${YELLOW}(skipped — conflicts with: %s)${NC}\n" \
                 "$name" "$conflict"
             log "SKIP (conflict with $conflict): $pkg"
@@ -118,9 +258,8 @@ safe_install_pkg() {
         fi
     done
 
-    (DEBIAN_FRONTEND=noninteractive apt-get install -y \
-        -o Dpkg::Options::="--force-confold" \
-        "$pkg" >> "$LOG_FILE" 2>&1) &
+    (DEBIAN_FRONTEND=noninteractive apt-get install -y "${APT_OPTS[@]}" \
+        "$pkg" < /dev/null >> "$LOG_FILE" 2>&1) &
     spinner $! "Installing ${name}..."
 }
 
@@ -137,8 +276,8 @@ proot_install_pkg() {
     fi
 
     (proot-distro login ubuntu -- bash -c \
-        "DEBIAN_FRONTEND=noninteractive apt-get install -y '$pkg'" \
-        >> "$LOG_FILE" 2>&1) &
+        "DEBIAN_FRONTEND=noninteractive apt-get install -y ${APT_OPTS_STR} '$pkg'" \
+        < /dev/null >> "$LOG_FILE" 2>&1) &
     spinner $! "Installing ${name} (Ubuntu)..."
 }
 
@@ -184,8 +323,8 @@ preflight_checks() {
         echo ""
         echo -e "  ${WHITE}You might run out of space during installation.${NC}"
         echo -e "  ${WHITE}Continue anyway? (y/n)${NC}"
-        read -rp "  " CONTINUE_INPUT
-        if [[ ! "$CONTINUE_INPUT" =~ ^[Yy] ]]; then
+        ask CONTINUE_INPUT "  [default: y]: "
+        if [[ ! "${CONTINUE_INPUT:-y}" =~ ^[Yy] ]]; then
             echo -e "  ${RED}Aborted.${NC}"
             exit 1
         fi
@@ -194,12 +333,24 @@ preflight_checks() {
     fi
 
     # Check network connectivity
-    if ping -c 1 -W 3 google.com &>/dev/null; then
+    # Don't rely on pinging google.com: ICMP is filtered on many networks and
+    # Google is unreachable in some countries. Try the hosts the install
+    # actually needs, over HTTPS, and only warn if none answer.
+    local net_ok="no" host
+    for host in https://packages-cf.termux.dev https://pypi.org https://github.com; do
+        if curl -fsS -o /dev/null --max-time 8 "$host" 2>/dev/null; then
+            net_ok="yes"; break
+        fi
+    done
+    if [ "$net_ok" = "no" ] && ping -c 1 -W 3 1.1.1.1 &>/dev/null; then
+        net_ok="yes"
+    fi
+    if [ "$net_ok" = "yes" ]; then
         echo -e "  ${GREEN}✔${NC}  Network: ${WHITE}Connected${NC}"
     else
-        echo -e "  ${RED}✘ No internet connection detected.${NC}"
-        echo -e "    ${WHITE}This script requires an internet connection to download packages.${NC}"
-        exit 1
+        echo -e "  ${YELLOW}⚠${NC}  Could not confirm an internet connection."
+        echo -e "    ${WHITE}The install downloads ~1 GB. It will fail without a connection.${NC}"
+        log "WARNING: network check failed"
     fi
 
     # Detect phone IP for later
@@ -215,15 +366,24 @@ preflight_checks() {
     echo -e "  ${GRAY}HACS is the add-on store for community integrations and themes.${NC}"
     echo -e "  ${GRAY}It must be installed BEFORE any other custom integration.${NC}"
     echo ""
-    while true; do
-        read -rp "  Install HACS? (y/n) [default: y]: " HACS_INPUT
-        HACS_INPUT=${HACS_INPUT:-y}
-        case "$HACS_INPUT" in
-            [Yy]*) INSTALL_HACS="yes"; echo -e "  ${GREEN}✔ HACS will be installed.${NC}"; break;;
-            [Nn]*) INSTALL_HACS="no";  echo -e "  ${GRAY}  HACS skipped.${NC}"; break;;
-            *) echo -e "  ${RED}Please enter y or n.${NC}";;
-        esac
-    done
+    if [ -n "$HACS_FROM_FLAG" ]; then
+        INSTALL_HACS="$HACS_FROM_FLAG"
+    else
+        while true; do
+            ask HACS_INPUT "  Install HACS? (y/n) [default: y]: "
+            HACS_INPUT=${HACS_INPUT:-y}
+            case "$HACS_INPUT" in
+                [Yy]*) INSTALL_HACS="yes"; break;;
+                [Nn]*) INSTALL_HACS="no";  break;;
+                *) echo -e "  ${RED}Please enter y or n.${NC}";;
+            esac
+        done
+    fi
+    if [ "$INSTALL_HACS" == "yes" ]; then
+        echo -e "  ${GREEN}✔ HACS will be installed.${NC}"
+    else
+        echo -e "  ${GRAY}  HACS skipped.${NC}"
+    fi
     [ "$INSTALL_HACS" == "yes" ] && TOTAL_STEPS=8
 
     echo ""
@@ -257,8 +417,8 @@ step_ubuntu() {
 
     # Update package lists inside Ubuntu
     (proot-distro login ubuntu -- bash -c \
-        "DEBIAN_FRONTEND=noninteractive apt-get update -y" \
-        >> "$LOG_FILE" 2>&1) &
+        "DEBIAN_FRONTEND=noninteractive apt-get update -y ${APT_OPTS_STR}" \
+        < /dev/null >> "$LOG_FILE" 2>&1) &
     spinner $! "Updating Ubuntu package lists..."
 }
 
@@ -400,11 +560,13 @@ STARTEOF
     echo -e "  ${GREEN}✔ Created ~/start-homeassistant.sh${NC}"
 
     # stop-homeassistant.sh
-    cat > "$TERMUX_HOME/stop-homeassistant.sh" << 'STOPEOF'
-#!/data/data/com.termux/files/usr/bin/bash
+    cat > "$TERMUX_HOME/stop-homeassistant.sh" << STOPEOF
+#!${TERMUX_PREFIX}/bin/bash
 echo "[*] Stopping Home Assistant..."
 
-pkill -f "hass" 2>/dev/null || true
+# Match the hass process itself, not anything with "hass" in its command line
+# (an editor open on ~/hass-config, a log tail, ...).
+pkill -f "hass-venv/bin/hass" 2>/dev/null || pkill -f "hass -c" 2>/dev/null || true
 
 if command -v termux-wake-unlock &>/dev/null; then
     termux-wake-unlock
@@ -428,7 +590,7 @@ echo "[*] Upgrading Home Assistant Core..."
 echo ""
 
 echo "[*] Stopping any running instance..."
-pkill -f "hass -c" 2>/dev/null || true
+pkill -f "hass-venv/bin/hass" 2>/dev/null || pkill -f "hass -c" 2>/dev/null || true
 sleep 2
 
 BEFORE=\$(proot-distro login ubuntu -- ${HASS_BIN} --version 2>/dev/null)
@@ -657,12 +819,21 @@ COMPLETE
 
 # ============== MAIN ==============
 main() {
-    log "setup-homeassistant.sh started"
+    log "setup-homeassistant.sh started (args: $*)"
+
+    if [ ! -d "$TERMUX_PREFIX" ] || ! command -v pkg >/dev/null 2>&1; then
+        echo -e "${RED}This script must be run inside Termux on Android.${NC}"
+        echo -e "Get Termux from F-Droid: https://f-droid.org/en/packages/com.termux/"
+        exit 1
+    fi
 
     # Acquire wake lock
     if command -v termux-wake-lock &>/dev/null; then
         termux-wake-lock
         log "Wake lock acquired."
+        # Release it however we exit: success, an early `exit 1`, or Ctrl+C.
+        trap 'termux-wake-unlock 2>/dev/null' EXIT
+        trap 'echo; echo "Interrupted. Re-run the script to continue — finished steps are skipped."; exit 130' INT TERM
     else
         echo -e "${YELLOW}  [!] termux-wake-lock unavailable — keep your screen on during install.${NC}"
         echo ""
@@ -687,4 +858,5 @@ main() {
     fi
 }
 
-main
+parse_args "$@"
+main "$@"
