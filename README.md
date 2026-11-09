@@ -1,11 +1,25 @@
-# Repurpose Your Old Android Phone
+# Linux on Android — Repurpose Your Old Phone
 
+[![shellcheck](https://github.com/mayukh4/linux-android/actions/workflows/shellcheck.yml/badge.svg)](https://github.com/mayukh4/linux-android/actions/workflows/shellcheck.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform: Android](https://img.shields.io/badge/platform-Android%207%2B-3ddc84.svg)](https://termux.dev)
 [![Termux](https://img.shields.io/badge/Termux-F--Droid-000000.svg)](https://f-droid.org/en/packages/com.termux/)
 [![Stars](https://img.shields.io/github/stars/mayukh4/linux-android?style=flat)](https://github.com/mayukh4/linux-android/stargazers)
+[![listed on unshittify.dev](https://unshittify.dev/badge.svg)](https://unshittify.dev/p/linux-android/)
 
-Turn any old Android phone into a **Linux desktop** or a **smart home server** — no PC, no root, no cloud. Just [Termux](https://termux.dev).
+Turn any old Android phone or tablet into a **Linux desktop** or a **smart home server** — no PC, no root, no cloud. Just [Termux](https://termux.dev).
+
+One script installs a **GPU-accelerated desktop** (XFCE4, LXQt, MATE or KDE Plasma) using native Termux packages and Termux-X11 — with Turnip/Zink hardware acceleration on Snapdragon, Firefox, VLC, Python, SSH, and optional Wine for Windows apps. A second script turns the phone into an always-on **Home Assistant** server with HACS.
+
+### Quick start
+
+In [Termux from F-Droid](https://f-droid.org/en/packages/com.termux/), with the [Termux-X11 app](https://github.com/termux/termux-x11/releases) installed:
+
+```bash
+pkg upgrade -y && curl -fsSL https://raw.githubusercontent.com/mayukh4/linux-android/main/termux-linux-setup.sh | bash
+```
+
+Then `bash ~/start-linux.sh` and open Termux-X11. Home Assistant instead? Swap in `setup-homeassistant.sh`. Full walkthrough [below](#installation).
 
 > Created to accompany a YouTube video walkthrough. Timestamps are referenced in the video description.
 
@@ -85,17 +99,42 @@ pkg upgrade -y
 
 The `termux-wake-lock` command keeps Termux alive when your screen turns off — without it, Android can kill the process mid-install. The `pkg upgrade` brings your base system up to date before the script runs, preventing a known crash involving `libpcre` and `libandroid-selinux`.
 
-### Step 3 — Download and run the script
+### Step 3 — Run the script
 
 ```bash
-curl -O https://raw.githubusercontent.com/mayukh4/linux-android/main/termux-linux-setup.sh
-chmod +x termux-linux-setup.sh
-bash termux-linux-setup.sh
+curl -fsSL https://raw.githubusercontent.com/mayukh4/linux-android/main/termux-linux-setup.sh | bash
 ```
 
 The script will ask you to choose a desktop environment and whether you want Wine. Everything else is automatic.
 
-Installation takes **10–30 minutes** depending on your internet speed. A full log is saved to `~/termux-setup.log` if anything goes wrong.
+Prefer to read it before running it? Download first:
+
+```bash
+curl -O https://raw.githubusercontent.com/mayukh4/linux-android/main/termux-linux-setup.sh
+less termux-linux-setup.sh
+bash termux-linux-setup.sh
+```
+
+Installation takes **10–30 minutes** depending on your internet speed. Each package shows a live timer and the latest download line, so you can tell a big download from a real hang. A full log is saved to `~/termux-setup.log`. Re-running the script is safe — anything already installed is skipped.
+
+<details>
+<summary>Unattended install (no questions)</summary>
+
+Pass choices as flags, and `-y` to accept defaults for anything not given:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mayukh4/linux-android/main/termux-linux-setup.sh | bash -s -- --de kde --no-wine -y
+```
+
+| Flag | Meaning |
+|---|---|
+| `--de xfce\|lxqt\|mate\|kde` | Desktop to install (default `xfce`) |
+| `--wine` / `--no-wine` | Windows app support (default: no) |
+| `-y`, `--yes` | Don't ask anything |
+| `-h`, `--help` | Show all options |
+
+`setup-homeassistant.sh` takes `--hacs` / `--no-hacs` and `-y` the same way.
+</details>
 
 ### Step 4 — Start your desktop
 
@@ -269,9 +308,10 @@ Home Assistant Core runs inside a lightweight Ubuntu container (via proot-distro
 ### Installation
 
 ```bash
-curl -O https://raw.githubusercontent.com/mayukh4/linux-android/main/setup-homeassistant.sh
-bash setup-homeassistant.sh
+curl -fsSL https://raw.githubusercontent.com/mayukh4/linux-android/main/setup-homeassistant.sh | bash
 ```
+
+Unattended: `... | bash -s -- --hacs -y`. Run `bash setup-homeassistant.sh --help` for all options.
 
 Installation takes **15–45 minutes** depending on your phone. The longest step is compiling Home Assistant's Python dependencies (numpy, cryptography, etc.) inside the Ubuntu container.
 
@@ -418,6 +458,21 @@ Ideas for what you can do with your old Android phone running this setup:
 
 ## Troubleshooting
 
+**The install looks stuck on one step**
+Big packages (KDE Plasma, Firefox, Wine) are hundreds of MB and can take 10+ minutes on a slow connection or phone. The spinner shows the elapsed time and the latest line from apt — if that line keeps changing, it is working. If nothing moves for 5 minutes the script prints a warning. Then:
+
+- Keep Termux in the foreground with the screen on, and make sure `termux-wake-lock` is active.
+- Check the live log from a second Termux session (swipe from the left edge → New session): `tail -f ~/termux-setup.log`
+- Press `Ctrl+C` and re-run the script. Already-installed packages are skipped, so you lose nothing.
+- If one mirror is slow, pick another with `termux-change-repo`.
+
+**Termux closes with "[Process completed (signal 9)]" (Android 12+)**
+Android 12 added a "phantom process killer" that kills background processes Termux starts. On **Android 14+**, turn on *Developer options → Disable child process restrictions*. On Android 12–13, run this once from a PC with [ADB](https://developer.android.com/tools/adb):
+
+```bash
+adb shell "/system/bin/device_config set_sync_disabled_for_tests persistent; /system/bin/device_config put activity_manager max_phantom_processes 2147483647"
+```
+
 **Script exits mid-install without a clear error**
 Check `~/termux-setup.log`. The script logs every package install result. The last line will tell you exactly which package triggered the failure.
 
@@ -473,6 +528,22 @@ Another HA instance is already running. Stop it first with `bash ~/stop-homeassi
 
 **Home Assistant: devices not discovered automatically**
 This is expected on Android. The `/proc/net/dev` restriction on Android 10+ prevents mDNS/Zeroconf from working. Add devices manually by IP address or use cloud-based integrations (Tuya, Govee Cloud, etc.).
+
+---
+
+## FAQ
+
+**Do I need root?** No. Everything runs as a normal Android app. Root is not used by either script.
+
+**Is this a proot / chroot distro like Andronix or UserLAnd?** The desktop is not. It uses native Termux packages and the Termux-X11 display server, so there is no emulation layer between the apps and the phone — that is what makes GPU acceleration through Turnip/Zink possible. Home Assistant does run in a proot-distro Ubuntu container, because it needs a glibc Python environment.
+
+**Will it work on my phone?** Any arm64 (64-bit) Android 7+ phone or tablet with 3 GB+ RAM should work. Qualcomm Snapdragon (Adreno GPU) gets full hardware acceleration; Mali, PowerVR and others fall back to software Vulkan, so pick XFCE4 or LXQt there.
+
+**Can I use the Play Store version of Termux?** No — it has been outdated for years and cannot install current packages. Use F-Droid or the [Termux GitHub releases](https://github.com/termux/termux-app/releases).
+
+**Can I use a keyboard, mouse and external monitor?** Yes. Bluetooth or USB keyboards and mice work in Termux-X11, and on phones with DisplayPort-over-USB-C (or Samsung DeX) you can put the desktop on a monitor.
+
+**How do I uninstall?** Run `bash ~/stop-linux.sh`, then remove the packages with `pkg uninstall <name>`, or simply clear Termux's app data to start fresh. For Home Assistant: `proot-distro remove ubuntu` and delete `~/hass-config`.
 
 ---
 
@@ -549,7 +620,9 @@ All hardcoded `/data/data/com.termux/...` paths have been replaced with `$PREFIX
 
 ## Contributing
 
-PRs and issues are welcome. If a package name has changed, a DE has a better startup command, or you've found a new conflict to handle, open an issue with your device model and Android version.
+PRs and issues are welcome. If a package name has changed, a DE has a better startup command, or you've found a new conflict to handle, open an issue with your device model and Android version. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+**Tested it on your device?** Even a one-line "works on Pixel 6 / Android 15 / XFCE4" report helps the next person — open an issue or comment on an existing one.
 
 ---
 
